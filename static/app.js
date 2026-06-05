@@ -97,21 +97,49 @@ async function _loadFeatureFlags() {
   } catch (_) {}
 }
 function _applyFeatureFlags() {
-  const toolBtnMap = {
+  // Sidebar sections (full sidebar)
+  const sectionMap = {
     email:     'email-section',
+  };
+  // Tool buttons inside the Tools section of the sidebar
+  const toolBtnMap = {
     compare:   'tool-compare-btn',
     gallery:   'tool-gallery-btn',
     research:  'tool-research-btn',
     cookbook:  'tool-cookbook-btn',
-    webhooks:  null,  // no sidebar entry
-    companion: null,  // no sidebar entry
   };
+  // Icon rail buttons (mobile / narrow view)
+  const railMap = {
+    email:     'rail-email',
+    compare:   'rail-compare',
+    gallery:   'rail-gallery',
+    research:  'rail-research',
+    cookbook:  'rail-cookbook',
+  };
+
   for (const [feature, enabled] of Object.entries(_featureFlags)) {
     if (enabled) continue;
-    const targetId = toolBtnMap[feature];
-    if (!targetId) continue;
-    const el = document.getElementById(targetId);
-    if (el) el.style.display = 'none';
+
+    // Hide sidebar section
+    const sectionId = sectionMap[feature];
+    if (sectionId) {
+      const el = document.getElementById(sectionId);
+      if (el) el.style.display = 'none';
+    }
+
+    // Hide sidebar tool button
+    const btnId = toolBtnMap[feature];
+    if (btnId) {
+      const el = document.getElementById(btnId);
+      if (el) el.style.display = 'none';
+    }
+
+    // Hide icon rail button
+    const railId = railMap[feature];
+    if (railId) {
+      const el = document.getElementById(railId);
+      if (el) el.style.display = 'none';
+    }
   }
 }
 _loadFeatureFlags();
