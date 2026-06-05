@@ -85,6 +85,37 @@ async function _refreshDefaultChat() {
 // synchronously; later reads should call _refreshDefaultChat() first.
 _refreshDefaultChat();
 
+// ── Feature flags: fetch & hide disabled sidebar sections / tool buttons ──
+let _featureFlags = {};
+async function _loadFeatureFlags() {
+  try {
+    const r = await fetch('/api/features');
+    const d = await r.json();
+    _featureFlags = d.data || {};
+    window._odysseusFeatureFlags = _featureFlags;
+    _applyFeatureFlags();
+  } catch (_) {}
+}
+function _applyFeatureFlags() {
+  const toolBtnMap = {
+    email:     'email-section',
+    compare:   'tool-compare-btn',
+    gallery:   'tool-gallery-btn',
+    research:  'tool-research-btn',
+    cookbook:  'tool-cookbook-btn',
+    webhooks:  null,  // no sidebar entry
+    companion: null,  // no sidebar entry
+  };
+  for (const [feature, enabled] of Object.entries(_featureFlags)) {
+    if (enabled) continue;
+    const targetId = toolBtnMap[feature];
+    if (!targetId) continue;
+    const el = document.getElementById(targetId);
+    if (el) el.style.display = 'none';
+  }
+}
+_loadFeatureFlags();
+
 async function _createDirectChatFromPreferredModel() {
   if (!sessionModule) return false;
 

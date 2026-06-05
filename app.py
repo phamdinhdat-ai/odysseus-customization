@@ -54,8 +54,9 @@ from core.constants import (
     REQUEST_TIMEOUT, OPENAI_API_KEY,
 )
 from core.database import SessionLocal, ApiToken
-from core.middleware import SecurityHeadersMiddleware
+from core.middleware import SecurityHeadersMiddleware, RequestIdMiddleware
 from core.auth import AuthManager
+from core.feature_flags import features
 from core.exceptions import (
     SessionNotFoundError, InvalidFileUploadError,
     LLMServiceError, WebSearchError,
@@ -79,6 +80,9 @@ app = FastAPI(
     description="Comprehensive AI chat with memory, research, and multi-modal capabilities",
     version="1.0.0",
 )
+
+# ========= REQUEST ID (outermost — wraps every request/response) =========
+app.add_middleware(RequestIdMiddleware)
 
 # ========= CORS =========
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost,http://127.0.0.1").split(",")
@@ -284,7 +288,8 @@ if AUTH_ENABLED:
                 # No users yet — redirect to login for first-time setup
                 if not path.startswith("/api/"):
                     return RedirectResponse(url="/login", status_code=302)
-                return JSONResponse(status_code=401, content={"error": "Setup required"})
+                from core.response_types import err as _auth_err
+                return _auth_err("SETUP_REQUIRED", "Setup required", status=401)
 
             # --- Bearer token auth (API tokens for external integrations) ---
             auth_header = request.headers.get("authorization", "")
@@ -292,7 +297,7 @@ if AUTH_ENABLED:
                 raw_token = auth_header[7:]
                 # Sanity check: tokens are "ody_" + 43 chars of base64
                 if len(raw_token) < 12 or len(raw_token) > 100:
-                    return JSONResponse(status_code=401, content={"error": "Invalid API token"})
+                    return _auth_err("INVALID_API_TOKEN", "Invalid API token", status=401)
                 prefix = raw_token[:8]
                 try:
                     if app.state._token_cache_dirty:
@@ -339,13 +344,13 @@ if AUTH_ENABLED:
                 except Exception:
                     logger.warning("API token auth error", exc_info=False)
                 # Invalid bearer token — reject immediately
-                return JSONResponse(status_code=401, content={"error": "Invalid API token"})
+                return _auth_err("INVALID_API_TOKEN", "Invalid API token", status=401)
 
             # --- Cookie-based session auth ---
             token = request.cookies.get(SESSION_COOKIE)
             if not auth_manager.validate_token(token):
                 if path.startswith("/api/"):
-                    return JSONResponse(status_code=401, content={"error": "Not authenticated"})
+                    return _auth_err("NOT_AUTHENTICATED", "Not authenticated", status=401)
                 return RedirectResponse(url="/login", status_code=302)
 
             # Attach current username to request state for downstream routes
@@ -357,6 +362,16 @@ if AUTH_ENABLED:
     logger.info("Auth middleware enabled (AUTH_ENABLED=true)")
 else:
     logger.info("Auth middleware disabled (set AUTH_ENABLED=true to enable)")
+
+# ========= FEATURE FLAGS ENDPOINT =========
+
+@app.get("/api/features")
+async def get_features():
+    """Return the current feature-flag state for frontend consumption.
+
+    The frontend reads this on load to hide/show panels and commands.
+    """
+    return JSONResponse(content={"ok": True, "data": features.to_dict()})
 
 # ========= STATIC FILES =========
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -430,8 +445,9 @@ async def serve_generated_image(filename: str, request: Request):
     )
 
 # ========= YOUTUBE INIT =========
-from services.youtube import init_youtube
-init_youtube()
+if features.web_search:
+    from services.youtube import init_youtube
+    init_youtube()
 
 # ========= RAG (vector document RAG) =========
 # VectorRAG (ChromaDB-backed personal-document semantic search). Initialized
@@ -484,21 +500,29 @@ tts_service = get_tts_service()
 logger.info("TTS service initialized (provider managed via admin settings)")
 
 # ========= EXCEPTION HANDLERS =========
+from core.response_types import err as _err, E_INTERNAL_ERROR
+
 @app.exception_handler(SessionNotFoundError)
 async def session_not_found_handler(request: Request, exc: SessionNotFoundError):
-    return JSONResponse(status_code=404, content={"error": "SESSION_NOT_FOUND", "message": str(exc)})
+    return _err("SESSION_NOT_FOUND", str(exc), status=404)
 
 @app.exception_handler(InvalidFileUploadError)
 async def invalid_file_upload_handler(request: Request, exc: InvalidFileUploadError):
-    return JSONResponse(status_code=400, content={"error": "INVALID_FILE_UPLOAD", "message": str(exc)})
+    return _err("INVALID_FILE_UPLOAD", str(exc), status=400)
 
 @app.exception_handler(LLMServiceError)
 async def llm_service_error_handler(request: Request, exc: LLMServiceError):
-    return JSONResponse(status_code=502, content={"error": "LLM_SERVICE_ERROR", "message": str(exc)})
+    return _err("LLM_SERVICE_ERROR", str(exc), status=502)
 
 @app.exception_handler(WebSearchError)
 async def web_search_error_handler(request: Request, exc: WebSearchError):
-    return JSONResponse(status_code=502, content={"error": "WEB_SEARCH_ERROR", "message": str(exc)})
+    return _err("WEB_SEARCH_ERROR", str(exc), status=502)
+
+# Generic catch-all — never let an unhandled exception leak raw stack traces.
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception: %s", exc)
+    return _err(E_INTERNAL_ERROR, "Internal server error", status=500)
 
 # ========= WEBHOOK MANAGER =========
 from src.webhook_manager import WebhookManager
@@ -548,16 +572,18 @@ app.include_router(setup_chat_routes(
 ))
 
 # Research (background deep-research tasks)
-from routes.research_routes import setup_research_routes
-app.include_router(setup_research_routes(research_handler, session_manager=session_manager))
+if features.research:
+    from routes.research_routes import setup_research_routes
+    app.include_router(setup_research_routes(research_handler, session_manager=session_manager))
 
 # History
 from routes.history_routes import setup_history_routes
 app.include_router(setup_history_routes(session_manager))
 
-# Search
-from routes.search_routes import setup_search_routes
-app.include_router(setup_search_routes(config))
+# Search (web)
+if features.web_search:
+    from routes.search_routes import setup_search_routes
+    app.include_router(setup_search_routes(config))
 
 # Presets
 from routes.preset_routes import setup_preset_routes
@@ -603,12 +629,14 @@ from routes.signature_routes import setup_signature_routes
 app.include_router(setup_signature_routes())
 
 # Gallery (image library)
-from routes.gallery_routes import setup_gallery_routes
-app.include_router(setup_gallery_routes())
+if features.gallery:
+    from routes.gallery_routes import setup_gallery_routes
+    app.include_router(setup_gallery_routes())
 
 # Persisted image-editor drafts (server-backed projects)
-from routes.editor_draft_routes import setup_editor_draft_routes
-app.include_router(setup_editor_draft_routes())
+if features.gallery:
+    from routes.editor_draft_routes import setup_editor_draft_routes
+    app.include_router(setup_editor_draft_routes())
 
 # Scheduled tasks + event bus
 from src.task_scheduler import TaskScheduler
@@ -630,16 +658,19 @@ from routes.shell_routes import setup_shell_routes
 app.include_router(setup_shell_routes())
 
 # Cookbook (model download/serve/cache, cookbook state sync)
-from routes.cookbook_routes import setup_cookbook_routes
-app.include_router(setup_cookbook_routes())
+if features.cookbook:
+    from routes.cookbook_routes import setup_cookbook_routes
+    app.include_router(setup_cookbook_routes())
 
 # Hardware model fitting (cookbook "What Fits?" tab)
-from routes.hwfit_routes import setup_hwfit_routes
-app.include_router(setup_hwfit_routes())
+if features.cookbook:
+    from routes.hwfit_routes import setup_hwfit_routes
+    app.include_router(setup_hwfit_routes())
 
 # Model A/B Comparison
-from routes.compare_routes import setup_compare_routes
-app.include_router(setup_compare_routes(session_manager))
+if features.compare:
+    from routes.compare_routes import setup_compare_routes
+    app.include_router(setup_compare_routes(session_manager))
 
 # User Preferences
 from routes.prefs_routes import setup_prefs_routes
@@ -671,8 +702,9 @@ set_ai_rag_manager(rag_manager, personal_docs_mgr)
 logger.info("AI interaction tools initialized (session, memory, RAG, UI control)")
 
 # Webhooks
-from routes.webhook_routes import setup_webhook_routes
-app.include_router(setup_webhook_routes(webhook_manager, auth_manager, session_manager, api_key_manager))
+if features.webhooks:
+    from routes.webhook_routes import setup_webhook_routes
+    app.include_router(setup_webhook_routes(webhook_manager, auth_manager, session_manager, api_key_manager))
 
 # API Tokens
 from routes.api_token_routes import setup_api_token_routes
@@ -685,8 +717,9 @@ from routes.note_routes import setup_note_routes
 app.include_router(setup_note_routes(task_scheduler))
 
 # Email
-from routes.email_routes import setup_email_routes
-app.include_router(setup_email_routes())
+if features.email:
+    from routes.email_routes import setup_email_routes
+    app.include_router(setup_email_routes())
 
 from routes.vault_routes import setup_vault_routes
 app.include_router(setup_vault_routes())
@@ -695,8 +728,9 @@ app.include_router(setup_vault_routes())
 from routes.contacts_routes import setup_contacts_routes
 app.include_router(setup_contacts_routes())
 
-from companion import setup_companion_routes
-app.include_router(setup_companion_routes())
+if features.companion:
+    from companion import setup_companion_routes
+    app.include_router(setup_companion_routes())
 
 # ========= ROUTES (kept in app.py) =========
 

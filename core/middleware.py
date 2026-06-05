@@ -3,11 +3,18 @@
 
 import os
 import secrets
+import uuid
+import time
+import logging
 
 from fastapi import HTTPException, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
+logger = logging.getLogger(__name__)
+
+# Per-process identifier — lets log aggregation group requests by process
+_PROCESS_ID = uuid.uuid4().hex[:8]
 
 # Per-process token that lets the in-app tool layer hit admin-gated
 # routes via HTTP loopback (the agent's tool calls don't carry the
@@ -15,6 +22,60 @@ from starlette.responses import Response
 # same value from this module. Never persisted or exposed externally.
 INTERNAL_TOOL_TOKEN = os.environ.get("ODYSSEUS_INTERNAL_TOKEN") or secrets.token_hex(32)
 INTERNAL_TOOL_HEADER = "X-Odysseus-Internal-Token"
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """Attach a unique request ID (X-Request-Id) to every request/response.
+
+    The ID is:
+    - Read from the client's ``X-Request-Id`` header if present (for
+      distributed tracing where the caller assigns IDs).
+    - Otherwise generated as a short UUID hex string.
+
+    Stored on ``request.state.request_id`` and emitted as a response header
+    so callers can correlate logs across hops.  A short log line is written
+    at completion time with method, path, status, and duration, making it
+    easy to grep the request flow end-to-end.
+    """
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        # Reuse caller-provided ID for distributed tracing, else generate.
+        req_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex[:16]
+        request.state.request_id = req_id
+        request.state.process_id = _PROCESS_ID
+
+        _start = time.monotonic()
+        _method = request.method
+        _path = request.url.path
+
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            logger.error(
+                "[req_id=%s] %s %s — unhandled exception in %.1fms",
+                req_id, _method, _path,
+                (time.monotonic() - _start) * 1000,
+                exc_info=True,
+            )
+            raise
+
+        duration_ms = (time.monotonic() - _start) * 1000
+        response.headers["X-Request-Id"] = req_id
+
+        # Log at INFO for slow requests (>=500ms) or non-2xx, else DEBUG.
+        _status = response.status_code
+        if duration_ms >= 500 or _status >= 400:
+            logger.info(
+                "[req_id=%s] %s %s → %d (%.1fms, proc=%s)",
+                req_id, _method, _path, _status, duration_ms, _PROCESS_ID,
+            )
+        else:
+            logger.debug(
+                "[req_id=%s] %s %s → %d (%.1fms)",
+                req_id, _method, _path, _status, duration_ms,
+            )
+
+        return response
 
 
 def require_admin(request: Request):

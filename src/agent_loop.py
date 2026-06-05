@@ -1118,6 +1118,15 @@ def _append_tool_results(
     for _m in messages:
         if _m.get("role") == "assistant":
             _m.pop("reasoning_content", None)
+
+    n_native = len(native_tool_calls) if native_tool_calls else 0
+    n_results = len(tool_results)
+    logger.info(
+        "Agent round=%d append_tool_results: used_native=%s native_calls=%d results=%d mode=%s",
+        round_num, used_native, n_native, n_results,
+        "native" if used_native and native_tool_calls else "fenced_block",
+    )
+
     if used_native and native_tool_calls:
         assistant_msg = {"role": "assistant"}
         # When the model emitted ONLY tool calls (no prose), content must be
@@ -1379,6 +1388,36 @@ async def stream_agent_loop(
         # public/non-admin users rather than trying to enumerate every tool.
         mcp_mgr = None
 
+    # Block tool categories for disabled features (offline mode, etc.)
+    try:
+        from core.feature_flags import features as _feat
+        if not _feat.email:
+            disabled_tools.update({
+                "list_email_accounts", "send_email", "list_emails",
+                "read_email", "reply_to_email", "bulk_email",
+                "archive_email", "delete_email", "mark_email_read",
+            })
+        if not _feat.web_search:
+            disabled_tools.update({"web_search", "web_fetch"})
+        if not _feat.research:
+            disabled_tools.update({"trigger_research", "manage_research"})
+        if not _feat.gallery:
+            disabled_tools.add("generate_image")
+        if not _feat.compare:
+            disabled_tools.add("compare_models")
+        if not _feat.cookbook:
+            disabled_tools.update({
+                "download_model", "serve_model", "list_served_models",
+                "stop_served_model", "list_downloads", "cancel_download",
+                "search_hf_models", "list_cached_models",
+                "list_serve_presets", "serve_preset", "adopt_served_model",
+                "list_cookbook_servers",
+            })
+        if not _feat.webhooks:
+            disabled_tools.add("manage_webhooks")
+    except Exception:
+        pass  # feature_flags not importable — allow all tools
+
     _t0 = time.time()
     _needs_admin = _detect_admin_intent(messages)
     _last_user = _extract_last_user_message(messages)
@@ -1439,6 +1478,13 @@ async def stream_agent_loop(
         # Always include core document/memory tools
         _relevant_tools.update({"create_document", "manage_memory", "manage_notes"})
         logger.info(f"[tool-rag] Keyword fallback selected: {sorted(_relevant_tools - ALWAYS_AVAILABLE)}")
+
+    logger.info(
+        "[agent] stream_agent_loop start session=%s model=%s owner=%s rounds=%d tools_selected=%d is_api=%s needs_admin=%s",
+        session_id, model, owner, max_rounds,
+        len(_relevant_tools) if _relevant_tools else 0,
+        _is_api_model, _needs_admin,
+    )
 
     # If a document is open the model needs the editing tools available
     # regardless of which selection path (RAG, keyword, caller-provided) ran
@@ -2256,8 +2302,14 @@ async def stream_agent_loop(
     if _fallback_chunk:
         yield _fallback_chunk
 
-    # --- Final metrics ---
+    # --- Final summary log ---
     total_duration = time.time() - total_start
+    logger.info(
+        "[agent] stream_agent_loop end session=%s model=%s rounds=%d tools=%d duration=%.1fs response_len=%d tool_events=%d",
+        session_id, model, round_num, total_tool_calls,
+        total_duration, len(full_response), len(tool_events),
+    )
+    # --- Final metrics ---
     metrics = _compute_final_metrics(
         messages, full_response, total_duration, time_to_first_token,
         context_length, real_input_tokens, real_output_tokens,
