@@ -367,11 +367,20 @@ else:
 # ========= FEATURE FLAGS ENDPOINT =========
 
 @app.get("/api/features")
-async def get_features():
+async def get_features(detailed: bool = False):
     """Return the current feature-flag state for frontend consumption.
 
     The frontend reads this on load to hide/show panels and commands.
+    Reloads from disk first so Settings UI changes are reflected.
+    Set ?detailed=true for metadata (source, description, etc.).
     """
+    features.reload()
+    if detailed:
+        return JSONResponse(content={
+            "ok": True,
+            "data": features.to_detailed_dict(),
+            "offline_mode": os.getenv("OFFLINE_MODE", "").lower() in ("1", "true", "yes"),
+        })
     return JSONResponse(content={"ok": True, "data": features.to_dict()})
 
 # ========= STATIC FILES =========
@@ -676,6 +685,10 @@ if features.compare:
 # User Preferences
 from routes.prefs_routes import setup_prefs_routes
 app.include_router(setup_prefs_routes())
+
+# Feature flag settings (UI-driven)
+from routes.settings_routes import setup_feature_settings_routes
+app.include_router(setup_feature_settings_routes())
 
 # Backup (export/import user data)
 from routes.backup_routes import setup_backup_routes

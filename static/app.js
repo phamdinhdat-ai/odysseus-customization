@@ -142,6 +142,8 @@ function _applyFeatureFlags() {
     }
   }
 }
+// Expose for external callers (admin features panel)
+window._applyFeatureFlags = _applyFeatureFlags;
 _loadFeatureFlags();
 
 async function _createDirectChatFromPreferredModel() {

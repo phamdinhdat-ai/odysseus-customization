@@ -1878,26 +1878,138 @@ function initWebhookForm() {
 }
 
 /* ── Features ── */
-const featureLabels = {
-  web_search: 'Web Search', deep_research: 'Deep Research',
-  memory: 'Memory', document_editor: 'Document Editor', rag: 'RAG Knowledge Base', sensitive_filter: 'Sensitive Info Filter',
-  gallery: 'Gallery'
-};
+
+// Group definitions for the features panel
+const FEATURE_CATEGORIES = [
+  {
+    label: 'Internet-Dependent',
+    keys: ['email', 'web_search', 'research', 'gallery', 'compare', 'cookbook', 'webhooks', 'companion'],
+    note: 'Disabled when OFFLINE_MODE=true in .env'
+  },
+  {
+    label: 'Core Tools',
+    keys: ['calendar', 'notes', 'tasks', 'memory', 'skills', 'documents', 'shell', 'presets', 'settings', 'search_chats'],
+    note: null
+  },
+  {
+    label: 'Voice & Debug',
+    keys: ['diagnostics', 'tts', 'stt'],
+    note: null
+  }
+];
+
+const FEATURE_CATEGORY_MAP = {};
+FEATURE_CATEGORIES.forEach(cat => cat.keys.forEach(k => FEATURE_CATEGORY_MAP[k] = cat.label));
 
 async function loadFeatures() {
   const container = el('adm-featureToggles');
   try {
-    const res = await fetch('/api/auth/features', { credentials: 'same-origin' });
-    const features = await res.json();
-    container.innerHTML = Object.entries(featureLabels).map(([key, label]) => `
-      <div class="admin-toggle-row" style="padding:0.4rem 0;border-bottom:1px solid var(--border);">
-        <div class="admin-toggle-label">${label}</div>
-        <label class="admin-switch"><input type="checkbox" data-adm-feature="${key}" ${features[key] ? 'checked' : ''}><span class="admin-slider"></span></label>
-      </div>`).join('');
-    container.querySelectorAll('input[data-adm-feature]').forEach(toggle => {
+    const res = await fetch('/api/settings/features', { credentials: 'same-origin' });
+    if (!res.ok) throw new Error('Failed to load features');
+    const data = await res.json();
+    const features = data.data || {};
+    const offlineInfo = data.offline_mode || {};
+    const offlineActive = offlineInfo.active || false;
+    const envOverride = offlineInfo.env_override || false;
+
+    // Offline mode toggle banner
+    let html = '';
+    if (offlineActive) {
+      const sourceLabel = envOverride
+        ? '<strong>&#9888; OFFLINE_MODE=true</strong> in .env — internet features disabled.'
+        : '<strong>&#128264; Offline Mode</strong> enabled from Settings UI.';
+      html += `<div class="admin-banner" style="margin-bottom:12px;padding:10px 14px;background:color-mix(in srgb, var(--warning) 15%, var(--panel));border-radius:8px;font-size:12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+        <span>${sourceLabel}</span>
+        ${envOverride
+          ? '<span style="opacity:0.6;font-size:11px">Change in .env to disable</span>'
+          : `<button id="adm-offline-toggle" class="admin-btn-delete" style="font-size:11px;padding:4px 10px;">Turn Off</button>`}
+      </div>`;
+    } else {
+      html += `<div style="margin-bottom:12px;display:flex;align-items:center;justify-content:flex-end;">
+        <button id="adm-offline-toggle" class="admin-btn-add" style="font-size:11px;padding:4px 12px;">&#128264; Enable Offline Mode</button>
+      </div>`;
+    }
+
+    let currentCategory = '';
+    for (const [key, info] of Object.entries(features)) {
+      const cat = FEATURE_CATEGORY_MAP[key];
+      if (cat && cat !== currentCategory) {
+        currentCategory = cat;
+        html += `<div style="font-size:11px;text-transform:uppercase;letter-spacing:0.5px;opacity:0.4;font-weight:600;margin:14px 0 6px;padding-top:6px;border-top:1px solid var(--border);">${currentCategory}</div>`;
+      }
+
+      const isEnvOverridden = info.source === 'env' || info.source === 'offline_mode';
+      const disabled = isEnvOverridden;
+      const envNote = info.source === 'env'
+        ? ' (overridden by .env)'
+        : info.source === 'offline_mode'
+          ? ' (disabled by OFFLINE_MODE)'
+          : '';
+
+      html += `<div class="admin-toggle-row" style="padding:0.35rem 0;border-bottom:1px solid var(--border);${disabled ? 'opacity:0.5' : ''}">
+        <div class="admin-toggle-label">
+          ${info.description || key}
+          ${envNote ? `<span style="font-size:10px;opacity:0.5;font-style:italic">${envNote}</span>` : ''}
+        </div>
+        <label class="admin-switch">
+          <input type="checkbox" data-adm-feature="${key}" ${info.enabled ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+          <span class="admin-slider"></span>
+        </label>
+      </div>`;
+    }
+
+    html += `<div class="admin-toggle-sub" style="margin-top:14px;font-size:11px;opacity:0.6;">
+      &#9432; Changes save immediately to <code>data/features.json</code>.
+      <strong>Route-level changes require a server restart.</strong>
+      Features overridden by <code>.env</code> or <code>OFFLINE_MODE</code> cannot be changed here.
+    </div>`;
+
+    container.innerHTML = html;
+
+    // Offline mode toggle button handler
+    const offlineBtn = container.querySelector('#adm-offline-toggle');
+    if (offlineBtn) {
+      offlineBtn.addEventListener('click', async () => {
+        const newState = !offlineActive;
+        offlineBtn.disabled = true;
+        offlineBtn.textContent = '...';
+        try {
+          await fetch('/api/settings/features/offline-mode', {
+            method: 'PUT',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: newState })
+          });
+          try {
+            const r = await fetch('/api/features', { credentials: 'same-origin' });
+            const d = await r.json();
+            window._odysseusFeatureFlags = d.data || {};
+            if (typeof window._applyFeatureFlags === 'function') window._applyFeatureFlags();
+          } catch (_) {}
+          loadFeatures();
+        } catch (e) {
+          offlineBtn.disabled = false;
+          offlineBtn.textContent = 'Failed';
+        }
+      });
+    }
+
+    container.querySelectorAll('input[data-adm-feature]:not([disabled])').forEach(toggle => {
       toggle.addEventListener('change', async () => {
         const body = {}; body[toggle.dataset.admFeature] = toggle.checked;
-        await fetch('/api/auth/features', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        await fetch('/api/settings/features', {
+          method: 'PUT',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        // Refresh the /api/features endpoint so the UI panels update
+        try {
+          const r = await fetch('/api/features', { credentials: 'same-origin' });
+          const d = await r.json();
+          window._odysseusFeatureFlags = d.data || {};
+          if (typeof window._applyFeatureFlags === 'function') window._applyFeatureFlags();
+        } catch (_) {}
       });
     });
   } catch (e) { container.innerHTML = '<div class="admin-error">Failed to load features</div>'; }
@@ -2057,6 +2169,7 @@ function refreshAll() {
   loadEndpoints();
   loadBuiltinTools();
   loadMcpServers();
+  loadFeatures();
 }
 
 /* ═══════════════════════════════════════════
